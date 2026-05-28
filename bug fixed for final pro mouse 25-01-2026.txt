@@ -1,0 +1,180 @@
+#include <BleCombo.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+// ================== CONFIGURATION ==================
+bool INVERT_X = true;  
+bool INVERT_Y = true;  
+float BASE_SENSITIVITY = 35.0f; 
+float MAX_SENSITIVITY = 55.0f;  
+float SCROLL_SENSITIVITY = 10.0f; 
+float SMOOTHING = 0.4f;         
+
+const uint32_t debounceMs = 25;          
+const uint32_t oskHoldTime = 1500;       
+const uint32_t scrollHoldTime = 800;    
+const uint32_t taskHoldTime = 2500;      // Slightly faster for "Pro" feel
+const float stillnessThreshold = 1.8;    // Tightened for better drag detection
+// ===================================================
+
+#define PIN_SDA 5
+#define PIN_SCL 6
+#define PIN_BTN_L 0
+#define PIN_BTN_R 1
+#define PIN_LED 7
+
+Adafruit_MPU6050 mpu;
+float biasX = 0, biasY = 0, biasZ = 0;
+float filteredX = 0, filteredY = 0;
+
+bool stableL = true, stableR = true;
+bool lastReadL = true, lastReadR = true;
+uint32_t lastDebounceL = 0, lastDebounceR = 0;
+
+uint32_t leftPressTime = 0;
+uint32_t rightPressTime = 0;
+uint32_t bothPressTime = 0;
+
+bool taskTriggered = false;
+bool oskTriggered = false;
+bool scrollActive = false;
+bool leftHeldHID = false; 
+bool isDragging = false; // NEW: Prevents Recent Tasks if we have moved at all
+
+uint32_t lastReportTime = 0;
+
+void setup() {
+  pinMode(PIN_LED, OUTPUT);
+  pinMode(PIN_BTN_L, INPUT_PULLUP);
+  pinMode(PIN_BTN_R, INPUT_PULLUP);
+  Wire.begin(PIN_SDA, PIN_SCL);
+  
+  if (!mpu.begin()) {
+    while (1) { digitalWrite(PIN_LED, !digitalRead(PIN_LED)); delay(100); }
+  }
+
+  sensors_event_t a, g, t;
+  for (int i = 0; i < 200; i++) {
+    mpu.getEvent(&a, &g, &t);
+    biasX += g.gyro.x; biasY += g.gyro.y; biasZ += g.gyro.z;
+    delay(2);
+  }
+  biasX /= 200; biasY /= 200; biasZ /= 200;
+
+  Keyboard.begin();
+  Mouse.begin(); 
+}
+
+void loop() {
+  if (!Keyboard.isConnected()) {
+    digitalWrite(PIN_LED, (millis() / 500) & 1);
+    return; 
+  }
+  digitalWrite(PIN_LED, HIGH);
+
+  uint32_t now = millis();
+  bool currentL = digitalRead(PIN_BTN_L);
+  bool currentR = digitalRead(PIN_BTN_R);
+
+  // --- 1. LEFT BUTTON (CLICK/DRAG/TASK) ---
+  if (currentL != lastReadL) { lastDebounceL = now; lastReadL = currentL; }
+  if ((now - lastDebounceL) > debounceMs) {
+    if (currentL != stableL) {
+      stableL = currentL;
+      if (stableL == LOW) { 
+        leftPressTime = now; 
+        taskTriggered = false; 
+        isDragging = false; 
+      }
+      else { 
+        if (leftHeldHID) { Mouse.release(MOUSE_LEFT); leftHeldHID = false; }
+      }
+    }
+  }
+
+  // --- 2. RIGHT BUTTON (SCROLL/CLICK) ---
+  if (currentR != lastReadR) { lastDebounceR = now; lastReadR = currentR; }
+  if ((now - lastDebounceR) > debounceMs) {
+    if (currentR != stableR) {
+      stableR = currentR;
+      if (stableR == LOW) { rightPressTime = now; scrollActive = false; }
+      else {
+        // Only click if we didn't spend the whole time scrolling
+        if (!scrollActive && !oskTriggered && (now - rightPressTime < 400)) Mouse.click(MOUSE_RIGHT);
+        scrollActive = false;
+      }
+    }
+  }
+
+  // --- 3. GESTURE ACTIVATION ---
+
+  // OSK: Both buttons for 1.5s
+  if (stableL == LOW && stableR == LOW) {
+    if (bothPressTime == 0) bothPressTime = now;
+    if (!oskTriggered && (now - bothPressTime > oskHoldTime)) {
+      if (leftHeldHID) { Mouse.release(MOUSE_LEFT); leftHeldHID = false; }
+      Keyboard.press(KEY_LEFT_GUI); Keyboard.press(KEY_LEFT_CTRL); Keyboard.press('o');
+      delay(100); Keyboard.releaseAll();
+      oskTriggered = true;
+    }
+  } else {
+    bothPressTime = 0;
+    if (stableL == HIGH && stableR == HIGH) oskTriggered = false;
+  }
+
+  // RECENT TASKS: Must be held AND perfectly still (isDragging must be false)
+  if (stableL == LOW && stableR == HIGH && !taskTriggered && !isDragging) {
+    if (now - leftPressTime > taskHoldTime) {
+      if (leftHeldHID) { Mouse.release(MOUSE_LEFT); leftHeldHID = false; } 
+      Keyboard.press(KEY_LEFT_GUI); Keyboard.press(KEY_TAB);
+      delay(100); Keyboard.releaseAll();
+      taskTriggered = true; 
+      digitalWrite(PIN_LED, LOW); delay(100); digitalWrite(PIN_LED, HIGH);
+    }
+  }
+
+  // SCROLL: Right hold for 0.8s
+  if (stableR == LOW && stableL == HIGH && (now - rightPressTime > scrollHoldTime)) {
+    scrollActive = true;
+  }
+
+  // NORMAL CLICK/DRAG
+  if (stableL == LOW && !taskTriggered && !oskTriggered && !leftHeldHID) {
+    Mouse.press(MOUSE_LEFT);
+    leftHeldHID = true;
+  }
+
+  // --- 4. MOTION PROCESSING ---
+  if (now - lastReportTime >= 10) { 
+    lastReportTime = now;
+    sensors_event_t a, g, t;
+    mpu.getEvent(&a, &g, &t);
+
+    filteredX = ( (g.gyro.z - biasZ) * SMOOTHING) + (filteredX * (1.0 - SMOOTHING));
+    filteredY = ( (g.gyro.x - biasX) * SMOOTHING) + (filteredY * (1.0 - SMOOTHING));
+
+    float mag = sqrt(filteredX * filteredX + filteredY * filteredY);
+
+    // If we move even a little while holding Left, kill the "Recent Task" timer
+    if (stableL == LOW && mag > stillnessThreshold) {
+      isDragging = true; 
+    }
+
+    if (scrollActive && stableR == LOW) { // Added "stableR == LOW" to prevent release flick
+      if (abs(filteredY) > 0.15) { // Threshold for scroll to prevent micro-drift
+        int scrollVal = constrain((int)(filteredY * SCROLL_SENSITIVITY), -5, 5);
+        Mouse.move(0, 0, scrollVal);
+      }
+    } else if (!scrollActive) {
+      float magnitude = sqrt(filteredX * filteredX + filteredY * filteredY);
+      float currentSens = (magnitude > 0.5) ? MAX_SENSITIVITY : BASE_SENSITIVITY;
+      int dx = (int)(filteredX * currentSens * (INVERT_X ? -1 : 1));
+      int dy = (int)(filteredY * currentSens * (INVERT_Y ? -1 : 1));
+      
+      if (abs(dx) > 0 || abs(dy) > 0) {
+        Mouse.move(constrain(dx, -35, 35), constrain(dy, -35, 35));
+      }
+    }
+  }
+}
